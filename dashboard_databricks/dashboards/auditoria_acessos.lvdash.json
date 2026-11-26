@@ -1,0 +1,877 @@
+{
+  "datasets": [
+    {
+      "name": "ds_auditoria",
+      "displayName": "Sessões de acesso a dashboards",
+      "queryLines": [
+        "WITH aberturas AS (\n",
+        "  -- Aberturas do dashboard (publicado ou rascunho): a auditoria registra o usuário real\n",
+        "  SELECT\n",
+        "    a.event_time,\n",
+        "    a.action_name,\n",
+        "    a.user_identity.email AS email,\n",
+        "    a.request_params.dashboard_id AS dashboard_id\n",
+        "  FROM system.access.audit a\n",
+        "  WHERE a.service_name = 'dashboards'\n",
+        "    AND a.action_name IN ('getPublishedDashboard', 'getDashboard')\n",
+        "    AND a.workspace_id = '7405604893278287'\n",
+        "    AND a.event_date >= add_months(current_date(), -6)\n",
+        "    AND a.request_params.dashboard_id IS NOT NULL\n",
+        "    AND a.user_identity.email IS NOT NULL\n",
+        "),\n",
+        "publicacoes AS (\n",
+        "  -- Warehouse da última publicação de cada dashboard (para aberturas sem consulta)\n",
+        "  SELECT request_params.dashboard_id AS dashboard_id, request_params.warehouse_id AS warehouse_id\n",
+        "  FROM system.access.audit\n",
+        "  WHERE service_name = 'dashboards'\n",
+        "    AND action_name = 'publishDashboard'\n",
+        "    AND workspace_id = '7405604893278287'\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY request_params.dashboard_id ORDER BY event_time DESC) = 1\n",
+        "),\n",
+        "historico AS (\n",
+        "  -- Consultas disparadas por dashboards. Com credenciais incorporadas o executor\n",
+        "  -- aparece como 'Unknown' (a consulta roda com a identidade de quem publicou).\n",
+        "  SELECT\n",
+        "    h.statement_id,\n",
+        "    h.query_source.dashboard_id AS dashboard_id,\n",
+        "    h.executed_by,\n",
+        "    h.start_time,\n",
+        "    COALESCE(h.end_time, h.start_time) AS end_time,\n",
+        "    h.compute.warehouse_id AS warehouse_id,\n",
+        "    h.from_result_cache,\n",
+        "    COALESCE(h.total_duration_ms, 0) AS duracao_ms,\n",
+        "    COALESCE(h.read_rows, 0) AS linhas_lidas,\n",
+        "    COALESCE(h.read_bytes, 0) AS bytes_lidos\n",
+        "  FROM system.query.history h\n",
+        "  WHERE h.workspace_id = '7405604893278287'\n",
+        "    AND h.start_time >= add_months(current_date(), -6)\n",
+        "    AND h.query_source.dashboard_id IS NOT NULL\n",
+        "    AND h.query_source.dashboard_id <> ''\n",
+        "),\n",
+        "consultas AS (\n",
+        "  -- Atribui consultas sem usuário identificado ao último visualizador que abriu\n",
+        "  -- o dashboard publicado nos 30 minutos anteriores\n",
+        "  SELECT\n",
+        "    COALESCE(\n",
+        "      CASE WHEN h.executed_by LIKE '%@%' THEN h.executed_by END,\n",
+        "      ab.email,\n",
+        "      'nao.identificado@desconhecido'\n",
+        "    ) AS email,\n",
+        "    h.dashboard_id,\n",
+        "    h.start_time AS inicio,\n",
+        "    h.end_time AS fim,\n",
+        "    h.warehouse_id,\n",
+        "    0 AS abertura_publicado,\n",
+        "    0 AS abertura_rascunho,\n",
+        "    1 AS consulta,\n",
+        "    CASE WHEN h.executed_by LIKE '%@%' THEN 0 ELSE 1 END AS atribuida,\n",
+        "    h.duracao_ms,\n",
+        "    h.linhas_lidas,\n",
+        "    h.bytes_lidos\n",
+        "  FROM historico h\n",
+        "  LEFT JOIN aberturas ab\n",
+        "    ON h.executed_by NOT LIKE '%@%'\n",
+        "   AND ab.action_name = 'getPublishedDashboard'\n",
+        "   AND ab.dashboard_id = h.dashboard_id\n",
+        "   AND ab.event_time <= h.start_time + make_interval(0, 0, 0, 0, 0, 0, 5)\n",
+        "   AND ab.event_time >= h.start_time - make_interval(0, 0, 0, 0, 0, 30, 0)\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY h.statement_id ORDER BY ab.event_time DESC NULLS LAST) = 1\n",
+        "),\n",
+        "atividades AS (\n",
+        "  SELECT\n",
+        "    ab.email,\n",
+        "    ab.dashboard_id,\n",
+        "    ab.event_time AS inicio,\n",
+        "    ab.event_time AS fim,\n",
+        "    p.warehouse_id,\n",
+        "    CASE WHEN ab.action_name = 'getPublishedDashboard' THEN 1 ELSE 0 END AS abertura_publicado,\n",
+        "    CASE WHEN ab.action_name = 'getDashboard' THEN 1 ELSE 0 END AS abertura_rascunho,\n",
+        "    0 AS consulta,\n",
+        "    0 AS atribuida,\n",
+        "    0 AS duracao_ms,\n",
+        "    0 AS linhas_lidas,\n",
+        "    0 AS bytes_lidos\n",
+        "  FROM aberturas ab\n",
+        "  LEFT JOIN publicacoes p ON ab.dashboard_id = p.dashboard_id\n",
+        "  UNION ALL\n",
+        "  SELECT * FROM consultas\n",
+        "),\n",
+        "marcadas AS (\n",
+        "  SELECT *,\n",
+        "    CASE WHEN LAG(inicio) OVER (PARTITION BY email, dashboard_id ORDER BY inicio) IS NULL\n",
+        "           OR inicio > MAX(fim) OVER (PARTITION BY email, dashboard_id ORDER BY inicio\n",
+        "                                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) + make_interval(0, 0, 0, 0, 0, 30, 0)\n",
+        "         THEN 1 ELSE 0 END AS nova_sessao\n",
+        "  FROM atividades\n",
+        "),\n",
+        "sessoes AS (\n",
+        "  SELECT *, SUM(nova_sessao) OVER (PARTITION BY email, dashboard_id ORDER BY inicio ROWS UNBOUNDED PRECEDING) AS sessao_n\n",
+        "  FROM marcadas\n",
+        "),\n",
+        "warehouses AS (\n",
+        "  SELECT warehouse_id, warehouse_name\n",
+        "  FROM system.compute.warehouses\n",
+        "  WHERE workspace_id = '7405604893278287'\n",
+        "  QUALIFY ROW_NUMBER() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) = 1\n",
+        "),\n",
+        "dashboards AS (\n",
+        "  SELECT * FROM VALUES\n",
+        "    ('01f19671c5031fe292d47900b4d5942a', 'Account Usage Dashboard V2 2026-08-12 17:18:00'),\n",
+        "    ('01f1882d2625112db9aaebc933222d14', 'Account Usage Dashboard V2'),\n",
+        "    ('01f1e92a572b190e9fc0d6a59f3d7d94', 'Auditoria de Acessos aos Dashboards'),\n",
+        "    ('01f1e926430515868790c72e9fec5f54', 'Orçamento MXM - Receita x Despesa')\n",
+        "  AS t(dashboard_id, dashboard_nome)\n",
+        ")\n",
+        "SELECT\n",
+        "  CAST(from_utc_timestamp(MIN(s.inicio), 'America/Sao_Paulo') AS DATE) AS data,\n",
+        "  INITCAP(REPLACE(SPLIT(s.email, '@')[0], '.', ' ')) AS nome,\n",
+        "  s.email,\n",
+        "  COALESCE(d.dashboard_nome, s.dashboard_id) AS dashboard,\n",
+        "  CASE WHEN SUM(s.abertura_publicado) > 0 THEN 'Publicado'\n",
+        "       WHEN SUM(s.abertura_rascunho) > 0 THEN 'Rascunho (edição)'\n",
+        "       ELSE 'Consulta' END AS tipo_acesso,\n",
+        "  COALESCE(MAX(w.warehouse_name), MAX(s.warehouse_id), 'Não identificado') AS warehouse,\n",
+        "  date_format(from_utc_timestamp(MIN(s.inicio), 'America/Sao_Paulo'), 'dd/MM/yyyy HH:mm') AS inicio_sessao,\n",
+        "  date_format(from_utc_timestamp(MAX(s.fim), 'America/Sao_Paulo'), 'dd/MM/yyyy HH:mm') AS fim_sessao,\n",
+        "  (unix_millis(MAX(s.fim)) - unix_millis(MIN(s.inicio))) / 60000.0 AS duracao_sessao_min,\n",
+        "  SUM(s.abertura_publicado + s.abertura_rascunho) AS aberturas,\n",
+        "  SUM(s.consulta) AS consultas,\n",
+        "  CASE WHEN SUM(s.consulta) = 0 THEN 'Sim' ELSE 'Não' END AS servido_do_cache,\n",
+        "  CASE WHEN SUM(s.atribuida) > 0 THEN 'Sim' ELSE 'Não' END AS credencial_incorporada,\n",
+        "  SUM(s.duracao_ms) / 1000.0 AS tempo_processamento_s,\n",
+        "  SUM(s.linhas_lidas) AS linhas_lidas,\n",
+        "  SUM(s.bytes_lidos) AS bytes_lidos\n",
+        "FROM sessoes s\n",
+        "LEFT JOIN warehouses w ON s.warehouse_id = w.warehouse_id\n",
+        "LEFT JOIN dashboards d ON s.dashboard_id = d.dashboard_id\n",
+        "GROUP BY s.email, s.dashboard_id, s.sessao_n, d.dashboard_nome\n",
+        "ORDER BY MIN(s.inicio) DESC\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "auditoria",
+      "displayName": "Auditoria",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "titulo",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Auditoria de Acessos aos Dashboards\n",
+                "\n",
+                "Quem acessou, por quanto tempo, quanto foi lido e em qual warehouse · últimos 6 meses"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filtro-periodo",
+            "queries": [
+              {
+                "name": "q_filtro-periodo",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "data",
+                      "expression": "`data`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "data",
+                    "displayName": "Período",
+                    "queryName": "q_filtro-periodo"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Período"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filtro-usuario",
+            "queries": [
+              {
+                "name": "q_filtro-usuario",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "nome",
+                    "displayName": "Usuário",
+                    "queryName": "q_filtro-usuario"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usuário"
+              }
+            }
+          },
+          "position": {
+            "x": 8,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "filtro-dashboard",
+            "queries": [
+              {
+                "name": "q_filtro-dashboard",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "dashboard",
+                      "expression": "`dashboard`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "dashboard",
+                    "displayName": "Dashboard",
+                    "queryName": "q_filtro-dashboard"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Dashboard"
+              }
+            }
+          },
+          "position": {
+            "x": 10,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpis",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "usuarios",
+                      "expression": "COUNT(DISTINCT `email`)"
+                    },
+                    {
+                      "name": "sessoes",
+                      "expression": "COUNT(`email`)"
+                    },
+                    {
+                      "name": "consultas",
+                      "expression": "SUM(`consultas`)"
+                    },
+                    {
+                      "name": "linhas",
+                      "expression": "SUM(`linhas_lidas`)"
+                    },
+                    {
+                      "name": "duracao",
+                      "expression": "AVG(`duracao_sessao_min`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "custom-vega-viz",
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usuarios"
+                  },
+                  {
+                    "fieldName": "sessoes"
+                  },
+                  {
+                    "fieldName": "consultas"
+                  },
+                  {
+                    "fieldName": "linhas"
+                  },
+                  {
+                    "fieldName": "duracao"
+                  }
+                ]
+              },
+              "jsonSpec": {
+                "type": "vega-lite",
+                "spec": "{\"$schema\": \"https://vega.github.io/schema/vega-lite/v6.json\", \"data\": {\"name\": \"databricks_query\"}, \"width\": \"container\", \"height\": \"container\", \"config\": {\"autosize\": {\"type\": \"fit\", \"contains\": \"padding\"}, \"view\": {\"stroke\": null}}, \"transform\": [{\"fold\": [\"usuarios\", \"sessoes\", \"consultas\", \"linhas\", \"duracao\"], \"as\": [\"k\", \"v\"]}, {\"calculate\": \"indexof([\\\"usuarios\\\", \\\"sessoes\\\", \\\"consultas\\\", \\\"linhas\\\", \\\"duracao\\\"], datum.k)\", \"as\": \"ordem\"}, {\"calculate\": \"datum.k == 'usuarios' ? 'USUÁRIOS' : datum.k == 'sessoes' ? 'SESSÕES' : datum.k == 'consultas' ? 'CONSULTAS' : datum.k == 'linhas' ? 'LINHAS LIDAS' : datum.k == 'duracao' ? 'DURAÇÃO MÉDIA' : ''\", \"as\": \"rotulo\"}, {\"calculate\": \"datum.k == 'usuarios' ? replace(abs(datum.v) >= 1e9 ? format(datum.v/1e9, '.1f') + ' bi' : abs(datum.v) >= 1e6 ? format(datum.v/1e6, '.1f') + ' mi' : abs(datum.v) >= 1e4 ? format(datum.v/1e3, '.1f') + ' mil' : format(datum.v, '.0f'), '.', ',') : datum.k == 'sessoes' ? replace(abs(datum.v) >= 1e9 ? format(datum.v/1e9, '.1f') + ' bi' : abs(datum.v) >= 1e6 ? format(datum.v/1e6, '.1f') + ' mi' : abs(datum.v) >= 1e4 ? format(datum.v/1e3, '.1f') + ' mil' : format(datum.v, '.0f'), '.', ',') : datum.k == 'consultas' ? replace(abs(datum.v) >= 1e9 ? format(datum.v/1e9, '.1f') + ' bi' : abs(datum.v) >= 1e6 ? format(datum.v/1e6, '.1f') + ' mi' : abs(datum.v) >= 1e4 ? format(datum.v/1e3, '.1f') + ' mil' : format(datum.v, '.0f'), '.', ',') : datum.k == 'linhas' ? replace(abs(datum.v) >= 1e9 ? format(datum.v/1e9, '.1f') + ' bi' : abs(datum.v) >= 1e6 ? format(datum.v/1e6, '.1f') + ' mi' : abs(datum.v) >= 1e4 ? format(datum.v/1e3, '.1f') + ' mil' : format(datum.v, '.0f'), '.', ',') : datum.k == 'duracao' ? replace(format(datum.v, '.1f'), '.', ',') + ' min' : ''\", \"as\": \"valor_fmt\"}, {\"calculate\": \"datum.k == 'usuarios' ? 'pessoas distintas' : datum.k == 'sessoes' ? 'acessos a dashboards' : datum.k == 'consultas' ? 'executadas no warehouse' : datum.k == 'linhas' ? 'volume processado' : datum.k == 'duracao' ? 'por sessão' : ''\", \"as\": \"sub\"}, {\"calculate\": \"datum.k == 'usuarios' ? '#1F3A5F' : datum.k == 'sessoes' ? '#2A9D8F' : datum.k == 'consultas' ? '#3A7CA5' : datum.k == 'linhas' ? '#E9C46A' : datum.k == 'duracao' ? '#E76F51' : ''\", \"as\": \"cor\"}], \"layer\": [{\"mark\": {\"type\": \"rect\", \"cornerRadius\": 6, \"color\": \"#8D99AE\", \"opacity\": 0.08}, \"encoding\": {\"x\": {\"field\": \"ordem\", \"type\": \"ordinal\", \"axis\": null, \"scale\": {\"paddingInner\": 0.06, \"paddingOuter\": 0}}, \"y\": {\"datum\": 0.0, \"type\": \"quantitative\", \"scale\": {\"domain\": [0, 1]}, \"axis\": null}, \"y2\": {\"datum\": 1.0}}}, {\"mark\": {\"type\": \"rect\", \"cornerRadius\": 2}, \"encoding\": {\"x\": {\"field\": \"ordem\", \"type\": \"ordinal\", \"axis\": null, \"scale\": {\"paddingInner\": 0.06, \"paddingOuter\": 0}}, \"y\": {\"datum\": 0.0, \"type\": \"quantitative\", \"scale\": {\"domain\": [0, 1]}, \"axis\": null}, \"y2\": {\"datum\": 0.04}, \"color\": {\"field\": \"cor\", \"type\": \"nominal\", \"scale\": null, \"legend\": null}}}, {\"mark\": {\"type\": \"text\", \"fontSize\": 11, \"fontWeight\": 600, \"letterSpacing\": 0.6, \"opacity\": 0.6, \"color\": {\"expr\": \"colors.textPrimary.default\"}}, \"encoding\": {\"x\": {\"field\": \"ordem\", \"type\": \"ordinal\", \"axis\": null, \"scale\": {\"paddingInner\": 0.06, \"paddingOuter\": 0}}, \"y\": {\"datum\": 0.8, \"type\": \"quantitative\", \"scale\": {\"domain\": [0, 1]}, \"axis\": null}, \"text\": {\"field\": \"rotulo\"}}}, {\"mark\": {\"type\": \"text\", \"fontSize\": 22, \"fontWeight\": 700, \"color\": {\"expr\": \"colors.textPrimary.default\"}}, \"encoding\": {\"x\": {\"field\": \"ordem\", \"type\": \"ordinal\", \"axis\": null, \"scale\": {\"paddingInner\": 0.06, \"paddingOuter\": 0}}, \"y\": {\"datum\": 0.5, \"type\": \"quantitative\", \"scale\": {\"domain\": [0, 1]}, \"axis\": null}, \"text\": {\"field\": \"valor_fmt\"}, \"tooltip\": [{\"field\": \"rotulo\", \"title\": \"Indicador\"}, {\"field\": \"v\", \"type\": \"quantitative\", \"title\": \"Valor\", \"format\": \",.2f\"}]}}, {\"mark\": {\"type\": \"text\", \"fontSize\": 11, \"fontWeight\": 500, \"opacity\": 0.7, \"color\": {\"expr\": \"colors.textPrimary.default\"}}, \"encoding\": {\"x\": {\"field\": \"ordem\", \"type\": \"ordinal\", \"axis\": null, \"scale\": {\"paddingInner\": 0.06, \"paddingOuter\": 0}}, \"y\": {\"datum\": 0.22, \"type\": \"quantitative\", \"scale\": {\"domain\": [0, 1]}, \"axis\": null}, \"text\": {\"field\": \"sub\"}}}]}"
+              },
+              "frame": {
+                "showTitle": false
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 12,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "sessoes-por-dia",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "daily(data)",
+                      "expression": "DATE_TRUNC(\"DAY\", `data`)"
+                    },
+                    {
+                      "name": "count(email)",
+                      "expression": "COUNT(`email`)"
+                    },
+                    {
+                      "name": "dashboard",
+                      "expression": "`dashboard`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(data)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Dia"
+                },
+                "y": {
+                  "fieldName": "count(email)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Sessões"
+                },
+                "color": {
+                  "fieldName": "dashboard",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Dashboard"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Sessões por dia"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 7,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "linhas-por-usuario",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "sum(linhas_lidas)",
+                      "expression": "SUM(`linhas_lidas`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "sum(linhas_lidas)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Linhas lidas",
+                  "format": {
+                    "type": "number",
+                    "abbreviation": "compact",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 1
+                    }
+                  }
+                },
+                "y": {
+                  "fieldName": "nome",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Usuário"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Linhas lidas por usuário"
+              }
+            }
+          },
+          "position": {
+            "x": 7,
+            "y": 5,
+            "width": 5,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "uso-por-warehouse",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "warehouse",
+                      "expression": "`warehouse`"
+                    },
+                    {
+                      "name": "sum(consultas)",
+                      "expression": "SUM(`consultas`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "sum(consultas)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Consultas"
+                },
+                "y": {
+                  "fieldName": "warehouse",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Warehouse"
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Consultas por warehouse"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 11,
+            "width": 5,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "acessos-por-dashboard",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "dashboard",
+                      "expression": "`dashboard`"
+                    },
+                    {
+                      "name": "count(email)",
+                      "expression": "COUNT(`email`)"
+                    },
+                    {
+                      "name": "countdistinct(email)",
+                      "expression": "COUNT(DISTINCT `email`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "fields": [
+                    {
+                      "fieldName": "count(email)",
+                      "displayName": "Sessões"
+                    },
+                    {
+                      "fieldName": "countdistinct(email)",
+                      "displayName": "Usuários"
+                    }
+                  ]
+                },
+                "y": {
+                  "fieldName": "dashboard",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Dashboard"
+                },
+                "color": {
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Sessões",
+                        "color": "#2A9D8F"
+                      },
+                      {
+                        "value": "Usuários",
+                        "color": "#1F3A5F"
+                      }
+                    ]
+                  }
+                },
+                "label": {
+                  "show": true
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Acessos por dashboard"
+              },
+              "mark": {
+                "layout": "group"
+              }
+            }
+          },
+          "position": {
+            "x": 5,
+            "y": 11,
+            "width": 7,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "detalhe-sessoes",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_auditoria",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "email",
+                      "expression": "`email`"
+                    },
+                    {
+                      "name": "dashboard",
+                      "expression": "`dashboard`"
+                    },
+                    {
+                      "name": "tipo_acesso",
+                      "expression": "`tipo_acesso`"
+                    },
+                    {
+                      "name": "warehouse",
+                      "expression": "`warehouse`"
+                    },
+                    {
+                      "name": "inicio_sessao",
+                      "expression": "`inicio_sessao`"
+                    },
+                    {
+                      "name": "fim_sessao",
+                      "expression": "`fim_sessao`"
+                    },
+                    {
+                      "name": "duracao_sessao_min",
+                      "expression": "`duracao_sessao_min`"
+                    },
+                    {
+                      "name": "aberturas",
+                      "expression": "`aberturas`"
+                    },
+                    {
+                      "name": "consultas",
+                      "expression": "`consultas`"
+                    },
+                    {
+                      "name": "servido_do_cache",
+                      "expression": "`servido_do_cache`"
+                    },
+                    {
+                      "name": "credencial_incorporada",
+                      "expression": "`credencial_incorporada`"
+                    },
+                    {
+                      "name": "linhas_lidas",
+                      "expression": "`linhas_lidas`"
+                    },
+                    {
+                      "name": "tempo_processamento_s",
+                      "expression": "`tempo_processamento_s`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "nome",
+                    "displayName": "Nome"
+                  },
+                  {
+                    "fieldName": "email",
+                    "displayName": "E-mail"
+                  },
+                  {
+                    "fieldName": "dashboard",
+                    "displayName": "Dashboard"
+                  },
+                  {
+                    "fieldName": "tipo_acesso",
+                    "displayName": "Tipo"
+                  },
+                  {
+                    "fieldName": "warehouse",
+                    "displayName": "Warehouse"
+                  },
+                  {
+                    "fieldName": "inicio_sessao",
+                    "displayName": "Início"
+                  },
+                  {
+                    "fieldName": "fim_sessao",
+                    "displayName": "Fim"
+                  },
+                  {
+                    "fieldName": "duracao_sessao_min",
+                    "displayName": "Duração (min)",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "aberturas",
+                    "displayName": "Aberturas",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "consultas",
+                    "displayName": "Consultas",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "servido_do_cache",
+                    "displayName": "Só cache"
+                  },
+                  {
+                    "fieldName": "credencial_incorporada",
+                    "displayName": "Cred. incorporada"
+                  },
+                  {
+                    "fieldName": "linhas_lidas",
+                    "displayName": "Linhas lidas",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 0
+                      }
+                    }
+                  },
+                  {
+                    "fieldName": "tempo_processamento_s",
+                    "displayName": "Processamento (s)",
+                    "format": {
+                      "type": "number",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Sessões de acesso (detalhe)",
+                "showDescription": true,
+                "description": "Sessão = aberturas e consultas do mesmo usuário no mesmo dashboard com intervalo de até 30 min. \"Só cache\" = resultados entregues pelo cache do dashboard, sem consulta ao warehouse (0 linhas lidas). \"Cred. incorporada\" = consultas executadas com a credencial de quem publicou, atribuídas ao último usuário que abriu o dashboard. Horários de Brasília."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 16,
+            "width": 12,
+            "height": 8
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#F3F5F8",
+        "dark": "#141A21"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#1C242D"
+      },
+      "widgetBorderColor": {
+        "light": "#E3E8EE",
+        "dark": "#2A3440"
+      },
+      "fontColor": {
+        "light": "#1B2A3A",
+        "dark": "#E6EBF0"
+      },
+      "selectionColor": {
+        "light": "#1F6FB2",
+        "dark": "#7FB8F0"
+      },
+      "visualizationColors": [
+        "#2A9D8F",
+        "#1F3A5F",
+        "#3A7CA5",
+        "#E9C46A",
+        "#E76F51",
+        "#8AB17D",
+        "#8D99AE"
+      ],
+      "widgetHeaderAlignment": "LEFT",
+      "fontFamily": "Inter",
+      "widgetCornerRadius": 8
+    }
+  }
+}
